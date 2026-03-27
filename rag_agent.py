@@ -5,7 +5,7 @@ KT 약관 RAG 에이전트 (멀티턴)
 임베딩     : text-embedding-3-small
 LLM        : gpt-4o-mini
 벡터 DB    : FAISS
-멀티턴     : 대화 히스토리 기반 질문 재구성 → 검색 → 답변
+멀티턴     : 대화 히스토리 수동 관리 → 질문 재구성 → 검색 → 답변
 """
 
 import os
@@ -16,10 +16,8 @@ from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import FAISS
-from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
@@ -80,9 +78,12 @@ def build_or_load_vectorstore(chunks=None):
 # ── 4. 멀티턴 RAG 체인 ────────────────────────────────────────────────────────
 def build_rag_chain(vectorstore):
     llm       = ChatOpenAI(model=MODEL_NAME, temperature=0)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+    retriever = vectorstore.as_retriever(
+        search_type="mmr",
+        search_kwargs={"k": 6, "fetch_k": 20},
+    )
 
-    # 4-1. 이전 대화를 반영해 독립적인 검색 질문으로 재구성
+    # 4-1. 히스토리를 반영해 독립적인 검색 질문으로 재구성
     contextualize_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "대화 히스토리와 최신 질문이 주어집니다. "
@@ -93,7 +94,7 @@ def build_rag_chain(vectorstore):
     ])
     contextualize_chain = contextualize_prompt | llm | StrOutputParser()
 
-    # 4-2. 재구성된 질문으로 검색 후 답변
+    # 4-2. 검색된 문서로 답변 생성
     qa_prompt = ChatPromptTemplate.from_messages([
         ("system",
          "당신은 KT 이용약관 전문 상담원입니다. "
@@ -103,49 +104,30 @@ def build_rag_chain(vectorstore):
         MessagesPlaceholder("chat_history"),
         ("human", "{question}"),
     ])
+    qa_chain = qa_prompt | llm | StrOutputParser()
 
-    def retrieve_with_history(inputs: dict) -> dict:
-        """히스토리가 있으면 질문 재구성 후 검색, 없으면 바로 검색"""
-        question = inputs["question"]
-        history  = inputs.get("chat_history", [])
-
+    def ask(question: str, chat_history: list) -> dict:
+        """질문 재구성 → 검색 → 답변 → 히스토리 반환"""
+        # 히스토리가 있으면 독립적인 질문으로 재구성
         standalone = (
-            contextualize_chain.invoke({"question": question, "chat_history": history})
-            if history else question
+            contextualize_chain.invoke({"question": question, "chat_history": chat_history})
+            if chat_history else question
         )
 
+        # 검색
         docs = retriever.invoke(standalone)
-        return {
-            "context":          "\n\n".join(d.page_content for d in docs),
-            "question":         question,
-            "chat_history":     history,
-            "source_documents": docs,
-        }
+        context = "\n\n".join(d.page_content for d in docs)
 
-    # 4-3. 전체 파이프라인
-    chain = (
-        RunnableLambda(retrieve_with_history)
-        | {
-            "answer":           qa_prompt | llm | StrOutputParser(),
-            "source_documents": RunnableLambda(lambda x: x["source_documents"]),
-          }
-    )
+        # 답변
+        answer = qa_chain.invoke({
+            "context":      context,
+            "question":     question,
+            "chat_history": chat_history,
+        })
 
-    # 4-4. 히스토리 자동 관리 (세션별 인메모리)
-    store: dict[str, ChatMessageHistory] = {}
+        return {"answer": answer, "source_documents": docs}
 
-    def get_session_history(session_id: str) -> ChatMessageHistory:
-        if session_id not in store:
-            store[session_id] = ChatMessageHistory()
-        return store[session_id]
-
-    return RunnableWithMessageHistory(
-        chain,
-        get_session_history,
-        input_messages_key="question",
-        history_messages_key="chat_history",
-        output_messages_key="answer",
-    ), store
+    return ask
 
 
 # ── 5. 출처 출력 ──────────────────────────────────────────────────────────────
@@ -174,9 +156,8 @@ def main():
 
     print("\n[✓] 멀티턴 RAG 체인 준비 완료\n")
 
-    chain, store = build_rag_chain(vectorstore)
-    SESSION_ID   = "kt-session"
-    config       = {"configurable": {"session_id": SESSION_ID}}
+    ask          = build_rag_chain(vectorstore)
+    chat_history = []   # [HumanMessage, AIMessage, ...]
 
     print("이전 대화 맥락이 유지됩니다.")
     print("명령어: 'reset' = 대화 초기화 | 'q' = 종료")
@@ -191,13 +172,17 @@ def main():
             print("종료합니다.")
             break
         if question.lower() in ("reset", "초기화"):
-            store.clear()
+            chat_history.clear()
             print("  대화 히스토리가 초기화되었습니다.")
             continue
 
-        result = chain.invoke({"question": question}, config=config)
+        result = ask(question, chat_history)
         print(f"\n답변: {result['answer']}")
         print_sources(result["source_documents"])
+
+        # 히스토리 누적
+        chat_history.append(HumanMessage(content=question))
+        chat_history.append(AIMessage(content=result["answer"]))
 
 
 if __name__ == "__main__":
